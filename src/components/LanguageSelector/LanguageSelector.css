@@ -1,0 +1,60 @@
+.header {
+    display: flex;
+    flex-direction: row-reverse;
+    margin: 15px 20px;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header>button {
+    border: none;
+    background: none;
+}
+
+.header>h1 {
+    color: var(--Color-4, #3B4E51);
+    text-align: right;
+    font-family: Cairo;
+    font-size: 30px;
+    font-style: normal;
+    font-weight: 700;
+    line-height: 39px;
+    /* 130% */
+}
+
+.body {
+    display: flex;
+    flex-direction: column;
+    gap: 25px;
+    margin: 20px;
+}
+
+
+.languages-box {
+    display: flex;
+    flex-direction: column;
+    gap: 25px;
+}
+
+.lang-item,.slider-item {
+    display: flex;
+    padding: 10px;
+    flex-direction: row-reverse;
+    justify-content: space-between;
+    align-items: center;
+    font-family: "Cairo", sans-serif;
+    font-size: 22px;
+    color: #3b4e51;
+    border-radius: 30px;
+    border: 1px solid #D1CDCD;
+    background: #FFF;
+    height: 80px;
+    flex-shrink: 0;
+}
+
+.lang-item input[type="checkbox"] {
+    width: 24px;
+    height: 24px;
+    cursor: pointer;
+    accent-color: #e9c469;
+}

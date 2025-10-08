@@ -1,0 +1,9 @@
+{
+    "appService.zipIgnorePattern": [
+        "node_modules{,/**}",
+        ".vscode{,/**}"
+    ],
+    "appService.showBuildDuringDeployPrompt": false,
+    "appService.defaultWebAppToDeploy": "/subscriptions/ecd0193b-01fc-4a76-93b3-7cc62c523dc2/resourceGroups/rg-ai/providers/Microsoft.Web/sites/PMP-ui",
+    "appService.deploySubpath": "dist"
+}

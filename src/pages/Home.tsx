@@ -1,10 +1,9 @@
 // src/pages/Home.tsx
-import HomeSlider from '../components/HomeSlider';
+import HomeSlider from '../components/HomeSlider/HomeSlider';
 
 const Home = () => {
   return (
     <div>
-      <h1>Bienvenue sur NiyabaChatBot</h1>
       <HomeSlider />
     </div>
   );

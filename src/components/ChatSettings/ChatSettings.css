@@ -1,0 +1,43 @@
+.header {
+    display: flex;
+    flex-direction: row-reverse;
+    margin: 15px 20px;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.header>button {
+    border: none;
+    background: none;
+}
+
+.header>h1 {
+    color: var(--Color-4, #3B4E51);
+    text-align: right;
+    font-family: Cairo;
+    font-size: 25px;
+    font-style: normal;
+    font-weight: 700;
+    line-height: 39px;
+    /* 130% */
+}
+
+.slider-item input[type="range"] {
+    width: 100%;
+    accent-color: #e9c469;
+    height: 30px;
+    /* Makes the slider thicker */
+    direction: rtl;
+    /* Reverses direction to right-to-left */
+}
+
+/* Optional: Style the thumb (handle) to be larger too */
+.slider-item input[type="range"]::-webkit-slider-thumb {
+    width: 20px;
+    height: 20px;
+}
+
+.slider-item input[type="range"]::-moz-range-thumb {
+    width: 20px;
+    height: 20px;
+}

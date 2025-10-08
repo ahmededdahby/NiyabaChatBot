@@ -1,6 +1,8 @@
 // webpack.config.js
 const path = require('path');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
+const CopyWebpackPlugin = require('copy-webpack-plugin');
+
 
 module.exports = {
   mode: 'development', // ou 'production' selon le besoin
@@ -37,6 +39,11 @@ module.exports = {
     new HtmlWebpackPlugin({
       template: './public/index.html',
     }),
+  new CopyWebpackPlugin({
+    patterns: [
+      { from: 'public/images', to: 'images' }, // copies images to dist/images
+    ],
+  }),
   ],
   devServer: {
     static: {
