@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./ChatBot.css";
+import { downsampleBuffer } from "../helpers/downsampleBuffer";
+import { encodeWAV } from "../helpers/encodeWAV";
 interface ChatBotProps {
   closeChat: () => void;
   openLanguageSelect: () => void;
@@ -9,6 +11,10 @@ interface ChatMessage {
   sender: "user" | "bot";
   text: string;
 }
+const API_BASE_URL =
+   "https://chikayaapi.azurewebsites.net";
+const TARGET_SAMPLE_RATE = 16000;
+
 const ChatBot: React.FC<ChatBotProps> = ({
   closeChat,
   openLanguageSelect,
@@ -20,7 +26,37 @@ const ChatBot: React.FC<ChatBotProps> = ({
   const [input, setInput] = useState("");
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+const [isRecording, setIsRecording] = useState(false);
+  const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
+  const [voiceList, setVoiceList] = useState<SpeechSynthesisVoice[]>([]);
+  const [speechUnsupportedNotified, setSpeechUnsupportedNotified] =
+    useState(false);
 
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  const speechSupported =
+    typeof window !== "undefined" && "speechSynthesis" in window;
+
+  useEffect(() => {
+    if (!speechSupported) return;
+    const synth = window.speechSynthesis;
+
+    const updateVoices = () => {
+      const voices = synth.getVoices();
+      if (voices.length > 0) {
+        setVoiceList(voices);
+      }
+    };
+
+    updateVoices();
+    synth.addEventListener("voiceschanged", updateVoices);
+    return () => {
+      synth.removeEventListener("voiceschanged", updateVoices);
+    };
+  }, [speechSupported]);
   const sendMessage = async () => {
     if (!input.trim()) return;
 
@@ -61,14 +97,259 @@ const ChatBot: React.FC<ChatBotProps> = ({
       setLoading(false);
     }
   };
+ const sendTextToChat = async (userMessage: string) => {
+    setMessages((prev) => [...prev, { sender: "user", text: userMessage }]);
 
+    try {
+      const response = await fetch(`${API_BASE_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: userMessage,
+          ...(conversationId && { conversation_id: conversationId }),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.reply) {
+        setMessages((prev) => [...prev, { sender: "bot", text: data.reply }]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { sender: "bot", text: "لم نتلق ردًا من الخادم." },
+        ]);
+      }
+
+      if (data.conversation_id) {
+        setConversationId(data.conversation_id);
+      }
+    } catch (error) {
+      console.error("Error sending message:", error);
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "حدث خطأ أثناء الاتصال بالخادم. حاول لاحقًا." },
+      ]);
+    }
+  };
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") sendMessage();
   };
+   const toggleRecording = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+
+    await startRecording();
+  };
+ const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "هذا المتصفح لا يدعم التسجيل الصوتي." },
+      ]);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      });
+
+      recorder.addEventListener("stop", () => {
+        setIsRecording(false);
+        stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
+
+        const chunks = audioChunksRef.current;
+        audioChunksRef.current = [];
+
+        if (!chunks.length) {
+          setMessages((prev) => [
+            ...prev,
+            { sender: "bot", text: "لم نلتقط أي صوت. حاولي مرة أخرى." },
+          ]);
+          return;
+        }
+
+        const mimeType = recorder.mimeType || "audio/webm";
+        const audioBlob = new Blob(chunks, { type: mimeType });
+        void handleAudioMessage(audioBlob);
+      });
+
+      recorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      console.error("Error starting audio recording:", error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: "bot",
+          text: "تعذر الوصول إلى الميكروفون. تأكدي من منح الإذن.",
+        },
+      ]);
+    }
+  };
+
+  const handleAudioMessage = async (rawBlob: Blob) => {
+    try {
+      setLoading(true);
+      const wavBlob = await convertBlobToWav(rawBlob);
+
+      const formData = new FormData();
+      formData.append("audio", wavBlob, "voice-input.wav");
+      formData.append("language", "ar-MA");
+
+      const response = await fetch(`${API_BASE_URL}/audio/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.text) {
+        const errorText =
+          (data && data.error) ||
+          "لم نتمكن من فهم الصوت. حاولي التحدث بوضوح أكبر.";
+        setMessages((prev) => [...prev, { sender: "bot", text: errorText }]);
+        return;
+      }
+
+      const transcript = (data.text as string).trim();
+      if (!transcript) {
+        setMessages((prev) => [
+          ...prev,
+          { sender: "bot", text: "لم نتمكن من فهم الصوت. حاولي مرة أخرى." },
+        ]);
+        return;
+      }
+
+      await sendTextToChat(transcript);
+    } catch (error) {
+      console.error("Error handling audio message:", error);
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "تعذر معالجة التسجيل الصوتي حالياً." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const convertBlobToWav = async (blob: Blob): Promise<Blob> => {
+    const arrayBuffer = await blob.arrayBuffer();
+    let audioContext = audioContextRef.current;
+    if (!audioContext) {
+      audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+    }
+
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    const channelData =
+      audioBuffer.numberOfChannels > 0
+        ? audioBuffer.getChannelData(0)
+        : new Float32Array(audioBuffer.length);
+
+    const downsampled = downsampleBuffer(
+      channelData,
+      audioBuffer.sampleRate,
+      TARGET_SAMPLE_RATE
+    );
+    const wavBuffer = encodeWAV(downsampled, TARGET_SAMPLE_RATE);
+    return new Blob([wavBuffer], { type: "audio/wav" });
+  };
+
+  const stopSpeech = () => {
+    if (!speechSupported) return;
+    window.speechSynthesis.cancel();
+    utteranceRef.current = null;
+    setSpeakingIndex(null);
+  };
+
+  const speakMessage = (text: string, index: number) => {
+    if (!speechSupported) {
+      if (!speechUnsupportedNotified) {
+        setSpeechUnsupportedNotified(true);
+        setMessages((prev) => [
+          ...prev,
+          {
+            sender: "bot",
+            text: "تحويل النص إلى كلام غير مدعوم في هذا المتصفح.",
+          },
+        ]);
+      }
+      return;
+    }
+
+    if (speakingIndex === index) {
+      stopSpeech();
+      return;
+    }
+
+    stopSpeech();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.95;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+
+    const preferredVoice =
+      voiceList.find(
+        (voice) =>
+          voice.lang?.toLowerCase().startsWith("ar") ||
+          /arabic|darija|moroccan/i.test(voice.name)
+      ) || voiceList[0];
+
+    if (preferredVoice) {
+      utterance.voice = preferredVoice;
+      utterance.lang = preferredVoice.lang || "ar-MA";
+    } else {
+      utterance.lang = "ar-MA";
+    }
+
+    utterance.onend = () => {
+      setSpeakingIndex(null);
+      utteranceRef.current = null;
+    };
+
+    utterance.onerror = (event) => {
+      console.error("Speech synthesis error:", event);
+      setSpeakingIndex(null);
+      utteranceRef.current = null;
+    };
+
+    utteranceRef.current = utterance;
+    setSpeakingIndex(index);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopSpeech();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   return (
     <>
       <div className="modal-header">
-        <div style={{ display: "flex" }}>
+        <div style={{ display: "flex", gap:"10px" }}>
           <button className="close-button" onClick={openSettings}>
             <svg
               width="52"
@@ -136,8 +417,8 @@ const ChatBot: React.FC<ChatBotProps> = ({
       </div>
 
       <div className="modal-body">
-        {messages.map((msg, i) => (
-          <div key={i} className={`chat-message ${msg.sender}`}>
+        {messages.map((msg, index) => (
+          <div key={index} className={`chat-message ${msg.sender}`}>
              {msg.sender === "bot" && (
       <div className="bot-icon" dangerouslySetInnerHTML={{ __html: `
         <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -158,6 +439,26 @@ const ChatBot: React.FC<ChatBotProps> = ({
       `}} />
     )}
             <div className="message-bubble">{msg.text}</div>
+             {msg.sender === "bot" && (
+              <button
+                className={`speak-button ${
+                  speakingIndex === index ? "playing" : ""
+                }`}
+                onClick={() => speakMessage(msg.text, index)}
+                title={
+                  speakingIndex === index
+                    ? "إيقاف القراءة الصوتية"
+                    : "تشغيل القراءة الصوتية"
+                }
+                aria-label={
+                  speakingIndex === index
+                    ? "إيقاف القراءة الصوتية"
+                    : "تشغيل القراءة الصوتية"
+                }
+              >
+                <span aria-hidden="true">🔊</span>
+              </button>
+            )}
           </div>
         ))}
         {loading && (
@@ -189,7 +490,11 @@ const ChatBot: React.FC<ChatBotProps> = ({
           </svg>
         </button>
         <button
-          style={{ border: "none", background: "none", marginBottom: "5px" }}
+          style={{ border: "none", background: "none" }}
+           className={`close-button ${isRecording ? "recording" : ""}`}
+          onClick={toggleRecording}
+          title={isRecording ? "إيقاف التسجيل" : "تسجيل رسالة صوتية"}
+          disabled={loading}
         >
           <svg
             width="55"
