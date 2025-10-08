@@ -14,7 +14,7 @@ const HomeSlider = () => {
         loop={true}
       >
         <SwiperSlide>
-          <img className="fit-image" src="images/Acceuil.png" alt="Slide 1" />
+          <img className="fit-image" src="images/Acceuil.jpg" alt="Slide 1" />
         </SwiperSlide>
         <SwiperSlide>
           <img src="/images/slide2.jpg" alt="Slide 2" />
