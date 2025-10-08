@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./ChatBot.css";
+import { downsampleBuffer } from "../helpers/downsampleBuffer";
+import { encodeWAV } from "../helpers/encodeWAV";
 interface ChatBotProps {
   closeChat: () => void;
   openLanguageSelect: () => void;
@@ -9,6 +11,9 @@ interface ChatMessage {
   sender: "user" | "bot";
   text: string;
 }
+const API_BASE_URL = "https://chikayaapi.azurewebsites.net";
+const TARGET_SAMPLE_RATE = 16000;
+
 const ChatBot: React.FC<ChatBotProps> = ({
   closeChat,
   openLanguageSelect,
@@ -20,7 +25,37 @@ const ChatBot: React.FC<ChatBotProps> = ({
   const [input, setInput] = useState("");
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [speakingIndex, setSpeakingIndex] = useState<number | null>(null);
+  const [voiceList, setVoiceList] = useState<SpeechSynthesisVoice[]>([]);
+  const [speechUnsupportedNotified, setSpeechUnsupportedNotified] =
+    useState(false);
 
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
+
+  const speechSupported =
+    typeof window !== "undefined" && "speechSynthesis" in window;
+
+  useEffect(() => {
+    if (!speechSupported) return;
+    const synth = window.speechSynthesis;
+
+    const updateVoices = () => {
+      const voices = synth.getVoices();
+      if (voices.length > 0) {
+        setVoiceList(voices);
+      }
+    };
+
+    updateVoices();
+    synth.addEventListener("voiceschanged", updateVoices);
+    return () => {
+      synth.removeEventListener("voiceschanged", updateVoices);
+    };
+  }, [speechSupported]);
   const sendMessage = async () => {
     if (!input.trim()) return;
 
@@ -61,14 +96,259 @@ const ChatBot: React.FC<ChatBotProps> = ({
       setLoading(false);
     }
   };
+  const sendTextToChat = async (userMessage: string) => {
+    setMessages((prev) => [...prev, { sender: "user", text: userMessage }]);
 
+    try {
+      const response = await fetch(`${API_BASE_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: userMessage,
+          ...(conversationId && { conversation_id: conversationId }),
+        }),
+      });
+
+      const data = await response.json();
+
+      if (data.reply) {
+        setMessages((prev) => [...prev, { sender: "bot", text: data.reply }]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { sender: "bot", text: "لم نتلق ردًا من الخادم." },
+        ]);
+      }
+
+      if (data.conversation_id) {
+        setConversationId(data.conversation_id);
+      }
+    } catch (error) {
+      console.error("Error sending message:", error);
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "حدث خطأ أثناء الاتصال بالخادم. حاول لاحقًا." },
+      ]);
+    }
+  };
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") sendMessage();
   };
+  const toggleRecording = async () => {
+    if (isRecording) {
+      mediaRecorderRef.current?.stop();
+      setIsRecording(false);
+      return;
+    }
+
+    await startRecording();
+  };
+  const startRecording = async () => {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "هذا المتصفح لا يدعم التسجيل الصوتي." },
+      ]);
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      const recorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+
+      recorder.addEventListener("dataavailable", (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      });
+
+      recorder.addEventListener("stop", () => {
+        setIsRecording(false);
+        stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
+
+        const chunks = audioChunksRef.current;
+        audioChunksRef.current = [];
+
+        if (!chunks.length) {
+          setMessages((prev) => [
+            ...prev,
+            { sender: "bot", text: "لم نلتقط أي صوت. حاولي مرة أخرى." },
+          ]);
+          return;
+        }
+
+        const mimeType = recorder.mimeType || "audio/webm";
+        const audioBlob = new Blob(chunks, { type: mimeType });
+        void handleAudioMessage(audioBlob);
+      });
+
+      recorder.start();
+      setIsRecording(true);
+    } catch (error) {
+      console.error("Error starting audio recording:", error);
+      setMessages((prev) => [
+        ...prev,
+        {
+          sender: "bot",
+          text: "تعذر الوصول إلى الميكروفون. تأكدي من منح الإذن.",
+        },
+      ]);
+    }
+  };
+
+  const handleAudioMessage = async (rawBlob: Blob) => {
+    try {
+      setLoading(true);
+      const wavBlob = await convertBlobToWav(rawBlob);
+
+      const formData = new FormData();
+      formData.append("audio", wavBlob, "voice-input.wav");
+      formData.append("language", "ar-MA");
+
+      const response = await fetch(`${API_BASE_URL}/audio/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok || !data.text) {
+        const errorText =
+          (data && data.error) ||
+          "لم نتمكن من فهم الصوت. حاولي التحدث بوضوح أكبر.";
+        setMessages((prev) => [...prev, { sender: "bot", text: errorText }]);
+        return;
+      }
+
+      const transcript = (data.text as string).trim();
+      if (!transcript) {
+        setMessages((prev) => [
+          ...prev,
+          { sender: "bot", text: "لم نتمكن من فهم الصوت. حاولي مرة أخرى." },
+        ]);
+        return;
+      }
+
+      await sendTextToChat(transcript);
+    } catch (error) {
+      console.error("Error handling audio message:", error);
+      setMessages((prev) => [
+        ...prev,
+        { sender: "bot", text: "تعذر معالجة التسجيل الصوتي حالياً." },
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const convertBlobToWav = async (blob: Blob): Promise<Blob> => {
+    const arrayBuffer = await blob.arrayBuffer();
+    let audioContext = audioContextRef.current;
+    if (!audioContext) {
+      audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
+    }
+
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+    const channelData =
+      audioBuffer.numberOfChannels > 0
+        ? audioBuffer.getChannelData(0)
+        : new Float32Array(audioBuffer.length);
+
+    const downsampled = downsampleBuffer(
+      channelData,
+      audioBuffer.sampleRate,
+      TARGET_SAMPLE_RATE
+    );
+    const wavBuffer = encodeWAV(downsampled, TARGET_SAMPLE_RATE);
+    return new Blob([wavBuffer], { type: "audio/wav" });
+  };
+
+  const stopSpeech = () => {
+    if (!speechSupported) return;
+    window.speechSynthesis.cancel();
+    utteranceRef.current = null;
+    setSpeakingIndex(null);
+  };
+
+  const speakMessage = (text: string, index: number) => {
+    if (!speechSupported) {
+      if (!speechUnsupportedNotified) {
+        setSpeechUnsupportedNotified(true);
+        setMessages((prev) => [
+          ...prev,
+          {
+            sender: "bot",
+            text: "تحويل النص إلى كلام غير مدعوم في هذا المتصفح.",
+          },
+        ]);
+      }
+      return;
+    }
+
+    if (speakingIndex === index) {
+      stopSpeech();
+      return;
+    }
+
+    stopSpeech();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.95;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+
+    const preferredVoice =
+      voiceList.find(
+        (voice) =>
+          voice.lang?.toLowerCase().startsWith("ar") ||
+          /arabic|darija|moroccan/i.test(voice.name)
+      ) || voiceList[0];
+
+    if (preferredVoice) {
+      utterance.voice = preferredVoice;
+      utterance.lang = preferredVoice.lang || "ar-MA";
+    } else {
+      utterance.lang = "ar-MA";
+    }
+
+    utterance.onend = () => {
+      setSpeakingIndex(null);
+      utteranceRef.current = null;
+    };
+
+    utterance.onerror = (event) => {
+      console.error("Speech synthesis error:", event);
+      setSpeakingIndex(null);
+      utteranceRef.current = null;
+    };
+
+    utteranceRef.current = utterance;
+    setSpeakingIndex(index);
+    window.speechSynthesis.speak(utterance);
+  };
+
+  useEffect(() => {
+    return () => {
+      stopSpeech();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   return (
     <>
       <div className="modal-header">
-        <div style={{ display: "flex" }}>
+        <div style={{ display: "flex", gap: "10px" }}>
           <button className="close-button" onClick={openSettings}>
             <svg
               width="52"
@@ -136,10 +416,13 @@ const ChatBot: React.FC<ChatBotProps> = ({
       </div>
 
       <div className="modal-body">
-        {messages.map((msg, i) => (
-          <div key={i} className={`chat-message ${msg.sender}`}>
-             {msg.sender === "bot" && (
-      <div className="bot-icon" dangerouslySetInnerHTML={{ __html: `
+        {messages.map((msg, index) => (
+          <div key={index} className={`chat-message ${msg.sender}`}>
+            {msg.sender === "bot" && (
+              <div
+                className="bot-icon"
+                dangerouslySetInnerHTML={{
+                  __html: `
         <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
           <rect width="32" height="32" rx="16" transform="matrix(-1 0 0 1 32 0)" fill="url(#paint0_linear_101_1732)"/>
           <path d="M6.49048 14.5627V15.125C6.49048 15.6874 6.96492 16.1618 7.52727 16.1618H7.94152V13.5259H7.52727C6.96492 13.5259 6.49048 13.9702 6.49048 14.5627Z" fill="white"/>
@@ -155,9 +438,31 @@ const ChatBot: React.FC<ChatBotProps> = ({
             </linearGradient>
           </defs>
         </svg>
-      `}} />
-    )}
+      `,
+                }}
+              />
+            )}
             <div className="message-bubble">{msg.text}</div>
+            {msg.sender === "bot" && (
+              <button
+                className={`speak-button ${
+                  speakingIndex === index ? "playing" : ""
+                }`}
+                onClick={() => speakMessage(msg.text, index)}
+                title={
+                  speakingIndex === index
+                    ? "إيقاف القراءة الصوتية"
+                    : "تشغيل القراءة الصوتية"
+                }
+                aria-label={
+                  speakingIndex === index
+                    ? "إيقاف القراءة الصوتية"
+                    : "تشغيل القراءة الصوتية"
+                }
+              >
+                <span aria-hidden="true">🔊</span>
+              </button>
+            )}
           </div>
         ))}
         {loading && (
@@ -168,10 +473,10 @@ const ChatBot: React.FC<ChatBotProps> = ({
       </div>
 
       <div className="modal-footer">
-        <button
+        {!isRecording &&<button
           className="send-button"
           onClick={sendMessage}
-          disabled={loading}
+          disabled={loading || isRecording}
         >
           <svg
             width="21"
@@ -187,48 +492,97 @@ const ChatBot: React.FC<ChatBotProps> = ({
               fill="white"
             />
           </svg>
-        </button>
+        </button>}
         <button
-          style={{ border: "none", background: "none", marginBottom: "5px" }}
+          style={{ border: "none", background: "none" }}
+          className={`close-button ${isRecording ? "recording" : ""}`}
+          onClick={toggleRecording}
+          title={isRecording ? "إيقاف التسجيل" : "تسجيل رسالة صوتية"}
+          disabled={loading}
         >
-          <svg
-            width="55"
-            height="55"
-            viewBox="0 0 55 55"
-            fill="none"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <rect
-              x="-0.5"
-              y="0.5"
-              width="54"
-              height="54"
-              rx="27"
-              transform="matrix(-1 0 0 1 54 0)"
-              fill="white"
-            />
-            <rect
-              x="-0.5"
-              y="0.5"
-              width="54"
-              height="54"
-              rx="27"
-              transform="matrix(-1 0 0 1 54 0)"
-              stroke="#898989"
-            />
-            <path
-              d="M38.0001 41.5006H36V38.5005H31.9998C30.6742 38.4989 29.4032 37.9716 28.4659 37.0342C27.5285 36.0968 27.0012 34.8259 26.9996 33.5003V32.2202L24.6835 31.4492C24.5415 31.4018 24.4119 31.3231 24.3044 31.2189C24.1968 31.1148 24.114 30.9878 24.0621 30.8474C24.0101 30.707 23.9904 30.5567 24.0043 30.4076C24.0182 30.2585 24.0654 30.1145 24.1425 29.9861L26.9996 25.2229V22.4998C27.0022 20.1136 27.9513 17.8258 29.6387 16.1385C31.326 14.4512 33.6137 13.5021 36 13.4994H41.0002V15.4995H36C34.1442 15.5021 32.3652 16.2405 31.0529 17.5528C29.7407 18.865 29.0023 20.644 28.9997 22.4998V25.4999C28.9994 25.681 28.95 25.8587 28.8567 26.0139L26.4996 29.9461L28.3166 30.5511C28.5157 30.6177 28.6887 30.7451 28.8113 30.9154C28.9339 31.0857 28.9998 31.2903 28.9997 31.5002V33.5003C29.0005 34.2957 29.3168 35.0583 29.8793 35.6208C30.4417 36.1832 31.2044 36.4996 31.9998 36.5004H37C37.2652 36.5004 37.5196 36.6057 37.7072 36.7933C37.8947 36.9808 38.0001 37.2352 38.0001 37.5004V41.5006Z"
-              fill="#898989"
-            />
-            <path
-              d="M30.9993 23.4998H34.9995V25.4999H30.9993V23.4998ZM21.3319 36.7174C20.598 36.0608 20.0108 35.2567 19.6088 34.3577C19.2068 33.4587 18.999 32.485 18.999 31.5002C18.999 30.5154 19.2068 29.5417 19.6088 28.6426C20.0108 27.7436 20.598 26.9396 21.3319 26.2829L22.665 27.773C22.1407 28.242 21.7213 28.8164 21.4341 29.4585C21.147 30.1007 20.9985 30.7962 20.9985 31.4997C20.9985 32.2031 21.147 32.8986 21.4341 33.5408C21.7213 34.183 22.1407 34.7573 22.665 35.2263L21.3319 36.7174Z"
-              fill="#898989"
-            />
-            <path
-              d="M18.3989 40.3007C17.033 39.2758 15.9245 37.947 15.161 36.4196C14.3975 34.8921 14 33.2079 14 31.5003C14 29.7927 14.3975 28.1085 15.161 26.5811C15.9245 25.0536 17.033 23.7249 18.3989 22.6999L19.5989 24.3C18.4809 25.1384 17.5735 26.2255 16.9485 27.4754C16.3235 28.7252 15.9981 30.1034 15.9981 31.5008C15.9981 32.8982 16.3235 34.2764 16.9485 35.5263C17.5735 36.7761 18.4809 37.8633 19.5989 38.7016L18.3989 40.3007Z"
-              fill="#898989"
-            />
-          </svg>
+          {isRecording ? (
+            <svg
+              width="55"
+              height="55"
+              viewBox="0 0 55 55"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <rect
+                width="55"
+                height="55"
+                rx="27.5"
+                transform="matrix(-1 0 0 1 55 0)"
+                fill="url(#paint0_linear_185_623)"
+              />
+              <path
+                d="M31 21C31 19.067 29.433 17.5 27.5 17.5C25.567 17.5 24 19.067 24 21V27.5C24 29.433 25.567 31 27.5 31C29.433 31 31 29.433 31 27.5V21Z"
+                fill="white"
+                stroke="white"
+                stroke-width="2"
+                stroke-linejoin="round"
+              />
+              <path
+                d="M20 27C20 31.142 23.358 34.5 27.5 34.5M27.5 34.5C31.642 34.5 35 31.142 35 27M27.5 34.5V37.5"
+                stroke="white"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+              <defs>
+                <linearGradient
+                  id="paint0_linear_185_623"
+                  x1="27.5626"
+                  y1="92.8125"
+                  x2="27.5626"
+                  y2="-14.3229"
+                  gradientUnits="userSpaceOnUse"
+                >
+                  <stop offset="0.277305" stop-color="#3B4E51" />
+                  <stop offset="1" stop-color="#E9C469" />
+                </linearGradient>
+              </defs>
+            </svg>
+          ) : (
+            <svg
+              width="55"
+              height="55"
+              viewBox="0 0 55 55"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <rect
+                x="-0.5"
+                y="0.5"
+                width="54"
+                height="54"
+                rx="27"
+                transform="matrix(-1 0 0 1 54 0)"
+                fill="white"
+              />
+              <rect
+                x="-0.5"
+                y="0.5"
+                width="54"
+                height="54"
+                rx="27"
+                transform="matrix(-1 0 0 1 54 0)"
+                stroke="#898989"
+              />
+              <path
+                d="M38.0001 41.5006H36V38.5005H31.9998C30.6742 38.4989 29.4032 37.9716 28.4659 37.0342C27.5285 36.0968 27.0012 34.8259 26.9996 33.5003V32.2202L24.6835 31.4492C24.5415 31.4018 24.4119 31.3231 24.3044 31.2189C24.1968 31.1148 24.114 30.9878 24.0621 30.8474C24.0101 30.707 23.9904 30.5567 24.0043 30.4076C24.0182 30.2585 24.0654 30.1145 24.1425 29.9861L26.9996 25.2229V22.4998C27.0022 20.1136 27.9513 17.8258 29.6387 16.1385C31.326 14.4512 33.6137 13.5021 36 13.4994H41.0002V15.4995H36C34.1442 15.5021 32.3652 16.2405 31.0529 17.5528C29.7407 18.865 29.0023 20.644 28.9997 22.4998V25.4999C28.9994 25.681 28.95 25.8587 28.8567 26.0139L26.4996 29.9461L28.3166 30.5511C28.5157 30.6177 28.6887 30.7451 28.8113 30.9154C28.9339 31.0857 28.9998 31.2903 28.9997 31.5002V33.5003C29.0005 34.2957 29.3168 35.0583 29.8793 35.6208C30.4417 36.1832 31.2044 36.4996 31.9998 36.5004H37C37.2652 36.5004 37.5196 36.6057 37.7072 36.7933C37.8947 36.9808 38.0001 37.2352 38.0001 37.5004V41.5006Z"
+                fill="#898989"
+              />
+              <path
+                d="M30.9993 23.4998H34.9995V25.4999H30.9993V23.4998ZM21.3319 36.7174C20.598 36.0608 20.0108 35.2567 19.6088 34.3577C19.2068 33.4587 18.999 32.485 18.999 31.5002C18.999 30.5154 19.2068 29.5417 19.6088 28.6426C20.0108 27.7436 20.598 26.9396 21.3319 26.2829L22.665 27.773C22.1407 28.242 21.7213 28.8164 21.4341 29.4585C21.147 30.1007 20.9985 30.7962 20.9985 31.4997C20.9985 32.2031 21.147 32.8986 21.4341 33.5408C21.7213 34.183 22.1407 34.7573 22.665 35.2263L21.3319 36.7174Z"
+                fill="#898989"
+              />
+              <path
+                d="M18.3989 40.3007C17.033 39.2758 15.9245 37.947 15.161 36.4196C14.3975 34.8921 14 33.2079 14 31.5003C14 29.7927 14.3975 28.1085 15.161 26.5811C15.9245 25.0536 17.033 23.7249 18.3989 22.6999L19.5989 24.3C18.4809 25.1384 17.5735 26.2255 16.9485 27.4754C16.3235 28.7252 15.9981 30.1034 15.9981 31.5008C15.9981 32.8982 16.3235 34.2764 16.9485 35.5263C17.5735 36.7761 18.4809 37.8633 19.5989 38.7016L18.3989 40.3007Z"
+                fill="#898989"
+              />
+            </svg>
+          )}
         </button>
         <div className="input-container">
           <button className="attach-btn" title="إرفاق ملف">

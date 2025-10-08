@@ -1,0 +1,34 @@
+.close-button.recording {
+  background-color: rgba(239, 68, 68, 0.12);
+  border-radius: 50%;
+  animation: micPulse 1.2s ease-in-out infinite alternate;
+}
+
+@keyframes micPulse {
+  from {
+    transform: scale(1);
+  }
+  to {
+    transform: scale(1.05);
+  }
+}
+
+.speak-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  margin-right: 6px;
+  font-size: 18px;
+  transition: transform 0.2s ease, color 0.2s ease;
+  color: #3b4e51;
+}
+
+.speak-button:hover {
+  transform: scale(1.1);
+  color: #c29f59;
+}
+
+.speak-button.playing {
+  color: #c29f59;
+  animation: micPulse 1s ease-in-out infinite alternate;
+}
